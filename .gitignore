@@ -15,6 +15,7 @@ dist/
 
 # Sideloaded WebDriverAgent builds
 *.ipa
+*.part
 
 # Editors
 .idea/

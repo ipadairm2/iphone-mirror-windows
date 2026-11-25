@@ -27,6 +27,24 @@ from .wda import WDA, WDAError, describe_error
 
 log = logging.getLogger(__name__)
 
+
+def com_mta():
+    """Make this thread a COM multithreaded apartment on Windows.
+
+    Qt's thread is single-threaded. Apple's USB service uses COM; calling it from
+    worker threads without COINIT_MULTITHREADED can bounce back into the GUI thread.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    hr = ole32.CoInitializeEx(None, 0) & 0xFFFFFFFF  # COINIT_MULTITHREADED
+    if hr not in (0, 1):
+        log.info("COM apartment init returned 0x%08x", hr)
+
+
 WDA_PORT = 8100
 WDA_RELEASE_URL = "https://github.com/appium/WebDriverAgent/releases/latest/download/WebDriverAgentRunner-Runner.zip"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -80,6 +98,7 @@ _HINTS = [
     (("refused to trust",), MSG_DENIED),
     (("trust dialog", "not paired", "does not trust this computer", "pairing with the device failed"), MSG_NOT_TRUSTED),
     (("developer mode is disabled",), MSG_DEV_MODE),
+    (("webdriveragent is not installed",), MSG_NO_WDA),
     (("cannot serve this device", "tunneld"), MSG_IOS_17_EARLY),
     (("explicitly trusted", "untrusted developer", "invalid code signature"), MSG_UNTRUSTED_DEV),
     (("has expired",), MSG_EXPIRED),
@@ -176,9 +195,21 @@ def _tie_to_job(proc):
         log.debug("could not tie child process to a job: %s", e)
 
 
+def _pmd3_argv(args):
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--internal-pmd3", *args]
+    return [_python(), "-m", "pymobiledevice3", *args]
+
+
+def _wifi_wda_argv():
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--internal-wifi-wda"]
+    return [_python(), "-m", "iphone_mirror.control.wifi_wda"]
+
+
 def _popen(args, **kw):
     proc = subprocess.Popen(
-        [_python(), "-m", "pymobiledevice3", *args],
+        _pmd3_argv(args),
         stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, env=_child_env(), **kw,
     )
     _tie_to_job(proc)
@@ -313,6 +344,20 @@ def developer_mode_enabled(udid, cancel=None):
     return out.strip().lower().startswith("true")
 
 
+def reveal_developer_mode():
+    """Ask iOS to display the Developer Mode switch in Settings -> Privacy & Security."""
+    devices = list_devices()
+    if not devices:
+        raise UsbError(MSG_NO_DEVICE)
+    udid = devices[0].get("Identifier") or devices[0].get("UniqueDeviceID")
+    if not udid:
+        raise UsbError("Connected iPhone reported no UDID")
+    code, out, err = pmd3("amfi", "reveal-developer-mode", "--udid", udid, timeout=30)
+    if code:
+        raise UsbError(failure_text(err or out, "Could not reveal Developer Mode"))
+    return devices[0].get("DeviceName") or "iPhone"
+
+
 def find_wda_bundle(udid, cancel=None):
     """Bundle id of the installed WebDriverAgent runner, or None."""
     code, out, err = pmd3("apps", "list", "--type", "User", "--udid", udid, timeout=60, cancel=cancel)
@@ -372,11 +417,14 @@ class UsbSession:
         self.ios = (0, 0)
         self.bundle = None
         self.local_port = None
+        self._wifi_base = None
         self._closed = threading.Event()
         self._lock = threading.Lock()
 
     @property
     def base_url(self):
+        if self._wifi_base:
+            return self._wifi_base
         port = self.local_port
         return f"http://127.0.0.1:{port}" if port else None
 
@@ -384,11 +432,25 @@ class UsbSession:
     def closed(self):
         return self._closed.is_set()
 
-    def bring_up(self, progress=lambda msg: None, wait=90):
+    def bring_up(self, progress=lambda msg: None, wait=90, prefer_wifi=False, devices=None):
         cancel = self._closed
-        progress("Looking for the iPhone on USB...")
-        devices = list_devices(cancel=cancel)
+        if prefer_wifi:
+            ip = phone_on_wifi(cancel=cancel)
+            if ip:
+                return self._over_wifi(ip, progress, wait, cancel)
+        if devices is None:
+            progress("Looking for the iPhone on USB...")
+            try:
+                devices = list_devices(cancel=cancel)
+            except UsbError as usb_err:
+                ip = phone_on_wifi(cancel=cancel)
+                if ip:
+                    return self._over_wifi(ip, progress, wait, cancel)
+                raise usb_err
         if not devices:
+            ip = phone_on_wifi(cancel=cancel)
+            if ip:
+                return self._over_wifi(ip, progress, wait, cancel)
             raise UsbError(MSG_NO_DEVICE)
         if len(devices) > 1:
             log.info("%d iPhones on USB, using the first one", len(devices))
@@ -435,6 +497,29 @@ class UsbSession:
         text = self.read_log("wda_runner")
         raise UsbError(explain(text) or MSG_WDA_TIMEOUT + "\n" + _tail(text))
 
+    def _over_wifi(self, ip, progress, wait, cancel):
+        """Start WDA over Wi-Fi, or reuse one already answering at the phone's LAN IP."""
+        url = f"http://{ip}:{WDA_PORT}"
+        if wda_ready(url, timeout=1.5):
+            log.info("WebDriverAgent already running at %s", url)
+            self._wifi_base = url
+            return url
+        progress("Starting WebDriverAgent over Wi-Fi...")
+        root = None if getattr(sys, "frozen", False) else str(Path(__file__).resolve().parents[2])
+        self._spawn_argv("wda_runner", _wifi_wda_argv(), cwd=root)
+        deadline = time.monotonic() + wait
+        while True:
+            if wda_ready(url):
+                self._wifi_base = url
+                return url
+            self.check()
+            if time.monotonic() > deadline:
+                break
+            if cancel.wait(1):
+                raise Cancelled()
+        text = self.read_log("wda_runner")
+        raise UsbError(explain(text) or "WebDriverAgent did not start over Wi-Fi.\n" + _tail(text))
+
     def check(self):
         """Raise UsbError if the session was closed or one of its processes has exited."""
         if self._closed.is_set():
@@ -470,6 +555,35 @@ class UsbSession:
                 raise UsbError(f"Could not start pymobiledevice3: {describe_error(e)}") from None
             self.procs.append((name, p, logf))
 
+    def _spawn_argv(self, name, argv, cwd=None):
+        """Start a child from a full command (unlike _spawn, does not wrap pymobiledevice3)."""
+        with self._lock:
+            if self._closed.is_set():
+                raise Cancelled()
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            logf = open(self.log_path(name), "w", encoding="utf-8", errors="replace")
+            logf.write(" ".join(argv) + "\n")
+            logf.flush()
+            log.info("spawn %s: %s", name, " ".join(argv))
+            env = _child_env()
+            if cwd:
+                env["PYTHONPATH"] = cwd + os.pathsep + env.get("PYTHONPATH", "")
+            try:
+                p = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    creationflags=NO_WINDOW,
+                    env=env,
+                    cwd=cwd,
+                )
+            except OSError as e:
+                logf.close()
+                raise UsbError(f"Could not start the helper: {describe_error(e)}") from None
+            _tie_to_job(p)
+            self.procs.append((name, p, logf))
+
     def close(self):
         with self._lock:
             self._closed.set()
@@ -487,6 +601,20 @@ class UsbSession:
                 _kill(p)
             logf.close()
         self.local_port = None
+        self._wifi_base = None
+
+
+def phone_on_wifi(cancel=None, timeout=4.0):
+    """IPv4 of an iPhone on this LAN, or None. Raises Cancelled if closed."""
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    try:
+        from .wifi_wda import find_phone_ipv4
+
+        return find_phone_ipv4(timeout)
+    except Exception:
+        log.info("no iPhone on Wi-Fi", exc_info=True)
+        return None
 
 
 def xcuitest_args(bundle, udid, ios=(0, 0)):
@@ -511,6 +639,7 @@ def _ipa_member(name):
         or ".." in parts
         or parts[-1].startswith("._")
         or parts[-1] == ".DS_Store"
+        or any(part.endswith(".dSYM") for part in parts)
     )
 
 

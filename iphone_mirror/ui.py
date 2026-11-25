@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QToolTip, QWidget
 
 from .control import ERROR, OFF, READY, STARTING
+from .recorder import ScreenRecorder
 
 log = logging.getLogger(__name__)
 
@@ -56,10 +57,34 @@ ZOOM_PER_NOTCH = 1.06
 ZOOM_MS = 30
 
 # Windows virtual-key codes: shortcuts must also work with non-Latin keyboard layouts
-VK_H, VK_J, VK_M, VK_U = 0x48, 0x4A, 0x4D, 0x55
+VK_C, VK_H, VK_I, VK_J, VK_L, VK_M, VK_R, VK_S, VK_U, VK_V = (
+    0x43,
+    0x48,
+    0x49,
+    0x4A,
+    0x4C,
+    0x4D,
+    0x52,
+    0x53,
+    0x55,
+    0x56,
+)
 VK_OEM_PLUS, VK_OEM_MINUS, VK_ADD, VK_SUBTRACT = 0xBB, 0xBD, 0x6B, 0x6D
 
 GREEN, ORANGE, RED = QColor("#30d158"), QColor("#ff9f0a"), QColor("#ff453a")
+
+
+def _rust_accel_active() -> bool:
+    try:
+        from .fairplay.playfair import playfair_decrypt
+        from .stream_ops import avcc_to_annexb
+
+        return (
+            playfair_decrypt.__module__.startswith("fairplay_rs")
+            and avcc_to_annexb.__module__.startswith("stream_ops_rs")
+        )
+    except Exception:
+        return False
 
 
 class Bridge(QObject):
@@ -68,6 +93,8 @@ class Bridge(QObject):
     frame = Signal(object, int, int)
     event = Signal(str, dict)
     control = Signal(str, str)  # Controller.on_state(state, message)
+    pasteboard = Signal(str)
+    hint = Signal(str)
 
 
 def app_icon(size: int = 64) -> QIcon:
@@ -124,11 +151,14 @@ def is_key(event, keys, vks=()) -> bool:
 
 
 class PhoneWindow(QWidget):
-    def __init__(self, settings, receiver_ref, controller=None):
+    def __init__(self, settings, receiver_ref, controller=None, receiver_factory=None, recorder=None, bridge=None):
         super().__init__()
         self.settings = settings
         self.rx = receiver_ref  # set later by main
         self.ctrl = controller  # control.Controller (optional)
+        self._receiver_factory = receiver_factory
+        self.recorder = recorder
+        self._bridge = bridge
         self.setWindowTitle("iPhone Mirror")
         self.setWindowIcon(app_icon())
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -142,6 +172,14 @@ class PhoneWindow(QWidget):
         self.state = "starting"
         self.info = {}
         self.client = None
+        self._source = settings.get("source", "airplay")
+        self._hw_decode = bool(settings.get("hw_decode", False))
+        self._show_hud = bool(settings.get("show_hud", False))
+        self._opacity = max(0.30, min(1.0, float(settings.get("opacity", 1.0))))
+        self._hud_stats = {}
+        self._hud_timer = QTimer(self, interval=500, timeout=self._refresh_hud)
+        if self._show_hud:
+            self._hud_timer.start()
         self.hover = False
         self.drag_offset = None
         self.fps = 0.0
@@ -165,12 +203,14 @@ class PhoneWindow(QWidget):
         self._pending_tap = None  # (x, y) fractions of a click that may still become a double tap
         self._tap_timer = QTimer(self, singleShot=True, interval=DOUBLE_TAP_MS, timeout=self._flush_tap)
         self._wheel_acc = 0.0
+        self._wheel_axis = "y"
         self._wheel_pos = (0.5, 0.5)
         self._wheel_timer = QTimer(self, singleShot=True, interval=WHEEL_BATCH_MS, timeout=self._flush_wheel)
         self._type_buf = ""
         self._type_timer = QTimer(self, singleShot=True, interval=TYPE_BATCH_MS, timeout=self._flush_type)
         self._effects = []  # touch feedback: dict(kind, a, b, t, life), positions as fractions
         self._anim = QTimer(self, interval=16, timeout=self._tick)
+        self._apply_opacity(self._opacity)
 
         screen = QApplication.primaryScreen().availableGeometry()
         ph = int(settings.get("phone_height") or 0) or int(screen.height() * 0.72)
@@ -283,8 +323,11 @@ class PhoneWindow(QWidget):
                 self.state = "connecting"
         elif event == "paused":
             self.state = "paused"
-        elif event == "mirror_stopped":
-            self.state = "waiting"
+        elif event == "resumed":
+            if self.image is not None:
+                self.state = "mirroring"
+        elif event in ("mirror_stopped", "unplugged"):
+            self.state = "unplugged" if event == "unplugged" else "waiting"
             self.image = None
             self._array = None
             self.src_size = None
@@ -384,6 +427,10 @@ class PhoneWindow(QWidget):
         p.setPen(QPen(QColor(0, 0, 0, 120), 1))
         p.drawRoundedRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5), r + 0.5, r + 0.5)
 
+        if self.recorder and self.recorder.recording:
+            self._paint_rec_pill(p, rect)
+        if self._show_hud:
+            self._paint_hud(p, rect)
         if self.hover:
             self._paint_bar(p)
         p.end()
@@ -410,9 +457,17 @@ class PhoneWindow(QWidget):
         self._paint_airplay_glyph(p, rect)
         name = self.info.get("name") or self.settings["name"]
         if self.state == "starting":
-            title, sub = "Starting...", "Preparing the AirPlay receiver"
+            sub = "Preparing USB cable stream (iOS 27+)" if self._source == "usb" else "Preparing the AirPlay receiver"
+            title = "Starting..."
+        elif self.state == "unplugged":
+            title, sub = "Plug in your iPhone", "Connect via USB cable and unlock your iPhone"
         elif self.state == "connecting":
-            title, sub = "Connecting...", f"{self.client or 'iPhone'} is starting Screen Mirroring"
+            sub = (
+                "Starting CoreDevice USB display stream"
+                if self._source == "usb"
+                else f"{self.client or 'iPhone'} is starting Screen Mirroring"
+            )
+            title = "Connecting..."
         elif self.state == "decrypt_error":
             title = "Could not decrypt the video"
             sub = (
@@ -517,7 +572,7 @@ class PhoneWindow(QWidget):
 
     def _buttons(self):
         b = self._bar_rect()
-        names = ("control", "home", "pin", "min", "close")
+        names = ("record", "shot", "control", "home", "pin", "min", "close")
         s = min(b.height(), max(18.0, (b.width() - 40) / len(names)))
         y = b.center().y() - s / 2
         right = b.right() - max(0.0, (b.height() - s) / 2)
@@ -536,6 +591,9 @@ class PhoneWindow(QWidget):
         if st == STARTING:
             return self.control_message.splitlines()[0] if self.control_message else "Starting control..."
         if st == READY:
+            backend = getattr(self.ctrl, "backend_name", "")
+            if backend in ("Native USB", "USB Cable"):
+                return f"Control on ({backend})"
             return "Control on"
         first = self.control_message.splitlines()[0] if self.control_message else ""
         return f"Control error: {first}" if first else "Control error"
@@ -544,11 +602,17 @@ class PhoneWindow(QWidget):
         """Top bar label, most detailed first; the painter uses the first one that fits."""
         if self._hint_text and time.monotonic() < self._hint_until:
             return [self._hint_text]
-        name = self.client or "iPhone"
+        name = self.client or ("iPhone (USB)" if self._source == "usb" else "iPhone")
+        rec = ""
+        if self.recorder and self.recorder.recording:
+            sec = int(self.recorder.elapsed_seconds)
+            rec = f"REC {sec // 60:02d}:{sec % 60:02d}"
         fps = f"{self.fps:.0f} fps" if self.state == "mirroring" and self.fps else ""
         status = self._control_status()
         sep = "  ·  "
-        labels = [sep.join(x for x in (name, fps, status) if x)]
+        labels = [sep.join(x for x in (rec, name, fps, status) if x)]
+        if rec:
+            labels.append(sep.join(x for x in (rec, status) if x))
         if fps:
             labels.append(sep.join(x for x in (name, status) if x))
         if status:
@@ -579,7 +643,7 @@ class PhoneWindow(QWidget):
 
         font = QFont("Segoe UI Semibold", 9)
         p.setFont(font)
-        text_rect = QRectF(b.x() + 14, b.y(), max(0.0, btn["control"].left() - b.x() - 18), b.height())
+        text_rect = QRectF(b.x() + 14, b.y(), max(0.0, btn["record"].left() - b.x() - 18), b.height())
         fm = QFontMetrics(font)
         labels = self._bar_labels()
         label = next((t for t in labels if fm.horizontalAdvance(t) <= text_rect.width()), None)
@@ -595,9 +659,34 @@ class PhoneWindow(QWidget):
             p.setBrush(QColor(255, 255, 255, 34))
             p.drawEllipse(btn[self._hover_btn].center(), s * 0.42, s * 0.42)
 
+        white = QColor(255, 255, 255, 220)
+        c = btn["record"].center()
+        if self.recorder and self.recorder.recording:
+            pulse = QColor(RED)
+            pulse.setAlphaF(0.45 + 0.55 * (0.5 + 0.5 * math.sin(time.monotonic() * 2 * math.pi)))
+            p.setPen(QPen(white, 1.4))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(c, 5.6 * k, 5.6 * k)
+            p.setPen(Qt.NoPen)
+            p.setBrush(pulse)
+            p.drawRoundedRect(QRectF(c.x() - 2.5 * k, c.y() - 2.5 * k, 5.0 * k, 5.0 * k), 1.0 * k, 1.0 * k)
+        else:
+            p.setPen(QPen(white, 1.4))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(c, 5.4 * k, 5.4 * k)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(RED))
+            p.drawEllipse(c, 2.7 * k, 2.7 * k)
+
+        c = btn["shot"].center()
+        p.setPen(QPen(white, 1.4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRectF(c.x() - 5.4 * k, c.y() - 2.8 * k, 10.8 * k, 7.4 * k), 1.8 * k, 1.8 * k)
+        p.drawRoundedRect(QRectF(c.x() - 2.2 * k, c.y() - 4.7 * k, 4.4 * k, 1.9 * k), 0.8 * k, 0.8 * k)
+        p.drawEllipse(QPointF(c.x(), c.y() + 0.9 * k), 2.0 * k, 2.0 * k)
+
         self._paint_hand(p, btn["control"].center() + QPointF(0.8 * k, 0.4 * k), k * 0.95, self._control_color())
 
-        white = QColor(255, 255, 255, 220)
         d = 4.5 * k
         c = btn["home"].center()
         home_on = self.control_state == READY
@@ -659,7 +748,9 @@ class PhoneWindow(QWidget):
 
     # ------------------------------------------------------------ animation
     def _needs_anim(self):
-        return bool(self._effects) or (self.hover and self.control_state == STARTING)
+        return bool(self._effects) or (self.hover and self.control_state == STARTING) or bool(
+            self.recorder and self.recorder.recording
+        )
 
     def _update_anim(self):
         if self._needs_anim() and not self._anim.isActive():
@@ -713,6 +804,8 @@ class PhoneWindow(QWidget):
             "pos": QPointF(pos),
             "t0": time.monotonic(),
             "moved": False,
+            "live": False,
+            "last_send": 0.0,
             "done": False,
             "double": double,  # second press of a double-click whose first click is still held back
         }
@@ -720,8 +813,11 @@ class PhoneWindow(QWidget):
         self.update()
 
     def _cancel_gesture(self):
-        self._g = None
+        g, self._g = self._g, None
         self._long_timer.stop()
+        if g and g.get("live") and self._control_ready():
+            b = to_fraction(self.phone_rect(), g["pos"])
+            self.ctrl.touch_release(*b)
         if self._pending_tap is not None and not self._tap_timer.isActive():
             self._flush_tap()  # its double-click will not complete now
 
@@ -759,7 +855,11 @@ class PhoneWindow(QWidget):
         rect = self.phone_rect()
         a = to_fraction(rect, g["pos0"])
         held = time.monotonic() - g["t0"]
-        if g["moved"]:
+        if g.get("live"):
+            b = to_fraction(rect, pos)
+            self.ctrl.touch_release(*b)
+            self._add_effect("swipe", a, b)
+        elif g["moved"]:
             self._flush_tap()
             b = to_fraction(rect, pos)
             self.ctrl.swipe(a[0], a[1], b[0], b[1], swipe_seconds(held))
@@ -782,9 +882,10 @@ class PhoneWindow(QWidget):
 
     def _flush_wheel(self):
         n, self._wheel_acc = self._wheel_acc, 0.0
+        axis = self._wheel_axis
         if abs(n) >= 0.05 and self._control_ready():
             self._flush_tap()  # keep the order: a click made before the scroll goes first
-            self.ctrl.scroll(self._wheel_pos[0], self._wheel_pos[1], n)
+            self.ctrl.scroll(self._wheel_pos[0], self._wheel_pos[1], n, axis=axis)
 
     def _type(self, text):
         self._type_buf += text
@@ -832,12 +933,18 @@ class PhoneWindow(QWidget):
         return super().event(e)
 
     def _button_tip(self, name):
+        if name == "record":
+            if self.recorder and self.recorder.recording:
+                return "Stop Screen Recording (Ctrl+R)"
+            return "Record Screen to MP4 (Ctrl+R)"
+        if name == "shot":
+            return "Save Screenshot (Ctrl+S)"
         if name == "control":
             return {
                 READY: "iPhone control is on - click to turn it off (Ctrl+U)",
                 STARTING: "iPhone control is starting - click to cancel (Ctrl+U)",
                 ERROR: "iPhone control failed - click to try again (Ctrl+U)",
-            }.get(self.control_state, "Control iPhone over USB (Ctrl+U)")
+            }.get(self.control_state, "Control iPhone (Ctrl+U)")
         return {"home": "Home (Ctrl+H)", "pin": "Always on top", "min": "Minimize", "close": "Close"}[name]
 
     def mousePressEvent(self, e):
@@ -865,6 +972,21 @@ class PhoneWindow(QWidget):
                 if math.hypot(d.x(), d.y()) > TAP_SLOP:
                     g["moved"] = True
                     self._long_timer.stop()
+                    if self._control_ready() and getattr(self.ctrl, "supports_live_touch", False):
+                        self._flush_tap()
+                        rect = self.phone_rect()
+                        a = to_fraction(rect, g["pos0"])
+                        b = to_fraction(rect, pos)
+                        self.ctrl.touch_contact(*a)
+                        self.ctrl.touch_contact(*b)
+                        g["live"] = True
+                        g["last_send"] = time.monotonic()
+            elif g.get("live") and not g["done"] and self._control_ready():
+                now = time.monotonic()
+                if now - g["last_send"] >= 0.016:
+                    b = to_fraction(self.phone_rect(), pos)
+                    self.ctrl.touch_contact(*b)
+                    g["last_send"] = now
             self.update()
             return
         if self.drag_offset is not None and e.buttons() & Qt.LeftButton:
@@ -911,32 +1033,60 @@ class PhoneWindow(QWidget):
 
     def wheelEvent(self, e):
         dy = e.angleDelta().y()
-        if e.modifiers() & Qt.ControlModifier:
+        dx = e.angleDelta().x()
+        mods = e.modifiers()
+        if (mods & Qt.ControlModifier) and (mods & Qt.ShiftModifier):
+            if dy:
+                self._set_opacity(self._opacity + (0.05 if dy > 0 else -0.05), hint=True)
+            return
+        if mods & Qt.ControlModifier:
             if dy:
                 self._zoom_acc += dy  # proportional: a touchpad pinch sends many small deltas
                 if not self._zoom_timer.isActive():
                     self._apply_zoom()
             return
-        if dy and self._gestures_on() and self.phone_rect().contains(e.position()):
+        if (mods & Qt.ShiftModifier) and dy and not dx:
+            dx, dy = dy, 0
+        if (dx or dy) and self._gestures_on() and self.phone_rect().contains(e.position()):
+            axis = "x" if abs(dx) > abs(dy) else "y"
+            delta = dx if axis == "x" else dy
+            if self._wheel_timer.isActive() and self._wheel_axis != axis:
+                self._flush_wheel()
+            self._wheel_axis = axis
             if not self._wheel_timer.isActive():
                 self._wheel_pos = to_fraction(self.phone_rect(), e.position())
                 self._wheel_timer.start()
-            self._wheel_acc += dy / 120  # > 0: wheel rotated away from the user
+            self._wheel_acc += delta / 120  # > 0: wheel rotated away from the user
 
     def keyPressEvent(self, e):
         mods = e.modifiers()
         if (mods & Qt.ControlModifier) and not (mods & Qt.AltModifier):
             rep = e.isAutoRepeat()
-            if is_key(e, (Qt.Key_Plus, Qt.Key_Equal), (VK_OEM_PLUS, VK_ADD)):
+            shift = bool(mods & Qt.ShiftModifier)
+            if not shift and is_key(e, (Qt.Key_Plus, Qt.Key_Equal), (VK_OEM_PLUS, VK_ADD)):
                 self.set_phone_height(self.phone_h * 1.1)
-            elif is_key(e, (Qt.Key_Minus,), (VK_OEM_MINUS, VK_SUBTRACT)):
+            elif not shift and is_key(e, (Qt.Key_Minus,), (VK_OEM_MINUS, VK_SUBTRACT)):
                 self.set_phone_height(self.phone_h / 1.1)
-            elif is_key(e, (Qt.Key_Up,)):
+            elif not shift and is_key(e, (Qt.Key_Up,)):
                 self._phone("button", "volumeUp")
-            elif is_key(e, (Qt.Key_Down,)):
+            elif not shift and is_key(e, (Qt.Key_Down,)):
                 self._phone("button", "volumeDown")
             elif rep:
                 pass  # Home / App Switcher / toggles: once per key press
+            elif shift and is_key(e, (Qt.Key_S,), (VK_S,)):
+                self.screenshot(to_clipboard=True)
+            elif shift and is_key(e, (Qt.Key_C,), (VK_C,)):
+                self._copy_phone_clipboard()
+            elif is_key(e, (Qt.Key_V,), (VK_V,)):
+                self._paste_pc_clipboard()
+            elif is_key(e, (Qt.Key_S,), (VK_S,)):
+                self.screenshot(to_clipboard=False)
+            elif is_key(e, (Qt.Key_R,), (VK_R,)):
+                self._toggle_recording()
+            elif is_key(e, (Qt.Key_I,), (VK_I,)):
+                self._toggle_hud()
+            elif is_key(e, (Qt.Key_L,), (VK_L,)):
+                self._phone("lock")
             elif is_key(e, (Qt.Key_H,), (VK_H,)):
                 self._phone("home")
             elif is_key(e, (Qt.Key_J,), (VK_J,)):
@@ -960,32 +1110,104 @@ class PhoneWindow(QWidget):
         m = QMenu(self)
         ready = self._control_ready()
         ctl = QAction(
-            "Control iPhone (USB)\tCtrl+U", m, checkable=True, checked=self.control_state in (STARTING, READY)
+            "Control iPhone\tCtrl+U", m, checkable=True, checked=self.control_state in (STARTING, READY)
         )
         ctl.setEnabled(self.ctrl is not None)
         ctl.triggered.connect(self._toggle_control)
         m.addAction(ctl)
+
+        if self.ctrl is not None:
+            cm = m.addMenu("Control Mode")
+            cur_mode = self.settings.get("control_mode", "auto")
+            for label, mode_id in (
+                ("Auto (Zero-App USB -> WDA)", "auto"),
+                ("Zero-App USB Only (iOS 27+)", "native"),
+                ("WebDriverAgent Only", "wda"),
+            ):
+                ma = QAction(label, cm, checkable=True, checked=cur_mode == mode_id)
+                ma.triggered.connect(lambda _=False, md=mode_id: self._set_control_mode(md))
+                cm.addAction(ma)
+
+        dev = m.addMenu("Device")
         for label, method, args in (
             ("Home\tCtrl+H", "home", ()),
             ("App Switcher\tCtrl+J", "app_switcher", ()),
             ("Volume Up\tCtrl+Up", "button", ("volumeUp",)),
             ("Volume Down\tCtrl+Down", "button", ("volumeDown",)),
+            ("Lock Screen\tCtrl+L", "lock", ()),
+            ("Unlock Screen", "unlock", ()),
+            ("Rotate Left", "rotate", ("left",)),
+            ("Rotate Right", "rotate", ("right",)),
+            ("Shake", "shake", ()),
         ):
-            a = m.addAction(label, lambda method=method, args=args: self._phone(method, *args))
+            a = dev.addAction(label, lambda method=method, args=args: self._phone(method, *args))
             a.setEnabled(ready)
+        dev.addSeparator()
+        dev.addAction("Reveal Developer Mode (USB)", self._reveal_dev_mode)
+
+        clip = m.addMenu("Clipboard")
+        a_send = clip.addAction("Send PC Clipboard to iPhone\tCtrl+V", self._paste_pc_clipboard)
+        a_get = clip.addAction("Copy iPhone Clipboard to PC\tCtrl+Shift+C", self._copy_phone_clipboard)
+        a_send.setEnabled(ready)
+        a_get.setEnabled(ready)
+
         m.addSeparator()
-        top = QAction("Always on Top", m, checkable=True, checked=self.settings.get("always_on_top", True))
-        top.triggered.connect(lambda: self._button("pin"))
-        m.addAction(top)
-        snd = QAction("Sound\tCtrl+M", m, checkable=True, checked=not (self.rx and self.rx.muted))
-        snd.triggered.connect(self._toggle_mute)
-        m.addAction(snd)
+        if self._receiver_factory is not None:
+            src_menu = m.addMenu("Source")
+            for label, src_id in (
+                ("AirPlay (Wi-Fi + Audio)", "airplay"),
+                ("USB Cable (iOS 27+ HEVC)", "usb"),
+            ):
+                act = QAction(label, src_menu, checkable=True, checked=self._source == src_id)
+                act.triggered.connect(lambda _=False, s=src_id: self._set_source(s))
+                src_menu.addAction(act)
+
+        qual = m.addMenu("Quality && Decode")
+        cur_h = int(self.settings.get("height") or 1080)
+        cur_fps = int(self.settings.get("fps") or 60)
+        for label, w, h in (("720p (1280x720)", 1280, 720), ("1080p (1920x1080)", 1920, 1080), ("1440p (2560x1440)", 2560, 1440)):
+            qa = QAction(label, qual, checkable=True, checked=cur_h == h)
+            qa.triggered.connect(lambda _=False, w=w, h=h: self._set_quality(w, h, cur_fps))
+            qual.addAction(qa)
+        qual.addSeparator()
+        for fval in (30, 60):
+            fa = QAction(f"{fval} fps", qual, checkable=True, checked=cur_fps == fval)
+            fa.triggered.connect(lambda _=False, fv=fval: self._set_quality(int(self.settings.get("width") or 1920), cur_h, fv))
+            qual.addAction(fa)
+        qual.addSeparator()
+        hwa = QAction("Hardware Decoding (GPU)", qual, checkable=True, checked=self._hw_decode)
+        hwa.triggered.connect(self._toggle_hw_decode)
+        qual.addAction(hwa)
+
+        op = m.addMenu("Opacity (Ctrl+Shift+Wheel)")
+        for pct in (100, 85, 70, 50):
+            oa = QAction(f"{pct}%", op, checkable=True, checked=abs(self._opacity * 100 - pct) < 4)
+            oa.triggered.connect(lambda _=False, v=pct / 100.0: self._set_opacity(v, hint=True))
+            op.addAction(oa)
+
         size = m.addMenu("Size")
         screen = (self.screen() or QApplication.primaryScreen()).availableGeometry()
         for label, k in (("Small", 0.5), ("Medium", 0.72), ("Large", 0.92)):
             size.addAction(label, lambda k=k: self.set_phone_height(screen.height() * k))
+
         m.addSeparator()
-        m.addAction("Save Screenshot", self.screenshot)
+        top = QAction("Always on Top", m, checkable=True, checked=self.settings.get("always_on_top", True))
+        top.triggered.connect(lambda: self._button("pin"))
+        m.addAction(top)
+        has_audio = getattr(self.rx, "has_audio", True) if self.rx else True
+        snd = QAction("Sound\tCtrl+M", m, checkable=True, checked=has_audio and not (self.rx and self.rx.muted))
+        snd.setEnabled(has_audio)
+        snd.triggered.connect(self._toggle_mute)
+        m.addAction(snd)
+        hud = QAction("Performance HUD\tCtrl+I", m, checkable=True, checked=self._show_hud)
+        hud.triggered.connect(self._toggle_hud)
+        m.addAction(hud)
+
+        m.addSeparator()
+        rec_label = "Stop Recording\tCtrl+R" if (self.recorder and self.recorder.recording) else "Record Screen (MP4)\tCtrl+R"
+        m.addAction(rec_label, self._toggle_recording)
+        m.addAction("Save Screenshot\tCtrl+S", lambda: self.screenshot(to_clipboard=False))
+        m.addAction("Copy Screenshot\tCtrl+Shift+S", lambda: self.screenshot(to_clipboard=True))
         m.addAction("Rename PC...", self._rename)
         m.addAction("Open Log", self._open_log)
         m.addSeparator()
@@ -997,6 +1219,10 @@ class PhoneWindow(QWidget):
             QApplication.quit()
         elif name == "min":
             self.showMinimized()
+        elif name == "record":
+            self._toggle_recording()
+        elif name == "shot":
+            self.screenshot(to_clipboard=False)
         elif name == "control":
             self._toggle_control()
         elif name == "home":
@@ -1010,6 +1236,233 @@ class PhoneWindow(QWidget):
             self.move(pos)
             self.show()
         self.update()
+
+    def _apply_opacity(self, value: float):
+        self._opacity = max(0.30, min(1.0, float(value)))
+        self.setWindowOpacity(self._opacity)
+
+    def _set_opacity(self, value: float, hint: bool = False):
+        self._apply_opacity(value)
+        self.settings["opacity"] = round(self._opacity, 2)
+        self.settings.save()
+        if hint:
+            self._hint(f"Opacity {round(self._opacity * 100)}%")
+
+    def _toggle_hud(self):
+        self._show_hud = not self._show_hud
+        self.settings["show_hud"] = self._show_hud
+        self.settings.save()
+        if self._show_hud:
+            self._refresh_hud()
+            self._hud_timer.start()
+        else:
+            self._hud_timer.stop()
+        self._hint("Performance HUD on" if self._show_hud else "Performance HUD off")
+        self.update()
+
+    def _refresh_hud(self):
+        if self.rx and hasattr(self.rx, "stats"):
+            self._hud_stats = self.rx.stats()
+        else:
+            self._hud_stats = {}
+        self.update()
+
+    def _paint_rec_pill(self, p, rect: QRectF):
+        sec = int(self.recorder.elapsed_seconds)
+        label = f"REC {sec // 60:02d}:{sec % 60:02d}"
+        font = QFont("Consolas", 8, QFont.Bold)
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(label)
+        pw = tw + 24
+        ph = 20
+        x = rect.right() - pw - 12
+        y = rect.y() + rect.width() * 0.045
+        pill = QRectF(x, y, pw, ph)
+        p.setPen(QPen(QColor(255, 255, 255, 45), 1))
+        p.setBrush(QColor(18, 18, 22, 200))
+        p.drawRoundedRect(pill, ph / 2, ph / 2)
+        dot = QColor(RED)
+        dot.setAlphaF(0.45 + 0.55 * (0.5 + 0.5 * math.sin(time.monotonic() * 2 * math.pi)))
+        p.setPen(Qt.NoPen)
+        p.setBrush(dot)
+        p.drawEllipse(QPointF(x + 10, pill.center().y()), 3.5, 3.5)
+        p.setFont(font)
+        p.setPen(QColor(255, 255, 255, 240))
+        p.drawText(QRectF(x + 17, y, tw + 4, ph), Qt.AlignVCenter | Qt.AlignLeft, label)
+
+    def _paint_hud(self, p, rect: QRectF):
+        stats = self._hud_stats or (self.rx.stats() if self.rx and hasattr(self.rx, "stats") else {})
+        src = stats.get("source", "USB Cable" if self._source == "usb" else "AirPlay")
+        codec = str(stats.get("active_codec") or ("hevc" if self._source == "usb" else "h264")).upper()
+        hw = "HW" if stats.get("hw_active") else "SW"
+        res = f"{self.src_size[0]}x{self.src_size[1]}" if self.src_size else "--"
+        mbps = float(stats.get("bitrate_kbps") or 0.0) / 1000.0
+        dec = float(stats.get("decode_ms") or 0.0)
+        abuf = float(stats.get("audio_buffer_ms") or 0.0)
+        drops = int(stats.get("dropped_frames") or 0)
+        rust = "Rust ON" if _rust_accel_active() else "Python"
+        lines = [
+            f"{src} · {codec} ({hw}) · {res}",
+            f"{self.fps:.0f} fps · {mbps:.1f} Mbps · {dec:.1f} ms",
+            f"Audio {abuf:.0f} ms · Drop {drops} · {rust}",
+        ]
+        font = QFont("Consolas", 8)
+        fm = QFontMetrics(font)
+        max_w = max(fm.horizontalAdvance(line) for line in lines)
+        box_w = min(rect.width() - 20, max_w + 18)
+        line_h = fm.height() + 2
+        box_h = line_h * len(lines) + 12
+        box = QRectF(rect.x() + 10, rect.bottom() - box_h - 12, box_w, box_h)
+        p.setPen(QPen(QColor(255, 255, 255, 42), 1))
+        p.setBrush(QColor(16, 16, 20, 198))
+        p.drawRoundedRect(box, 9, 9)
+        p.setFont(font)
+        p.setPen(QColor(235, 240, 245, 235))
+        y = box.y() + 6
+        for line in lines:
+            text_fit = fm.elidedText(line, Qt.ElideRight, int(box_w - 16))
+            p.drawText(QRectF(box.x() + 9, y, box_w - 16, line_h), Qt.AlignVCenter | Qt.AlignLeft, text_fit)
+            y += line_h
+
+    def _toggle_recording(self):
+        if self.recorder is None:
+            self.recorder = ScreenRecorder(fps=int(self.settings.get("fps") or 30))
+            if self.rx and hasattr(self.rx, "decoder"):
+                self.rx.decoder.on_raw_frame = self.recorder.push_video
+        if self.recorder.recording:
+            path = self.recorder.stop()
+            self._update_anim()
+            if path is not None:
+                if self._tray:
+                    self._tray.showMessage("Recording saved", str(path), app_icon(), 3500)
+                self._hint(f"Saved {path.name}")
+            else:
+                self._hint("Recording stopped (no frames)")
+        else:
+            expect_audio = bool(getattr(self.rx, "has_audio", False)) if self.rx else None
+            path = self.recorder.start(expect_audio=expect_audio)
+            self._update_anim()
+            self._hint(f"Recording -> {path.name}")
+        self.update()
+
+    def _set_source(self, source: str):
+        if source == self._source or self._receiver_factory is None:
+            return
+        if self.recorder and self.recorder.recording:
+            self.recorder.stop()
+        self._source = source
+        self.settings["source"] = source
+        self.settings.save()
+        old = self.rx
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:
+                log.exception("failed stopping previous receiver")
+        self.image = None
+        self._array = None
+        self.src_size = None
+        self.client = None
+        self.state = "starting"
+        if abs(self.aspect - DEFAULT_ASPECT) > 0.01:
+            self.aspect = DEFAULT_ASPECT
+            self._relayout()
+        self.rx = self._receiver_factory(source, self._hw_decode)
+        self._update_target()
+        self.rx.start()
+        self._hint("Switched to USB Cable (iOS 27+)" if source == "usb" else "Switched to AirPlay")
+        self.update()
+
+    def _set_quality(self, width: int, height: int, fps: int):
+        changed = (
+            self.settings.get("width") != width
+            or self.settings.get("height") != height
+            or self.settings.get("fps") != fps
+        )
+        self.settings["width"] = width
+        self.settings["height"] = height
+        self.settings["fps"] = fps
+        self.settings.save()
+        if changed:
+            msg = f"Quality {height}p {fps}fps"
+            if self.state == "mirroring":
+                msg += " (reconnect to apply)"
+            self._hint(msg)
+
+    def _toggle_hw_decode(self):
+        self._hw_decode = not self._hw_decode
+        self.settings["hw_decode"] = self._hw_decode
+        self.settings.save()
+        if self.rx and hasattr(self.rx, "decoder"):
+            self.rx.decoder.set_hw_decode(self._hw_decode)
+        self._hint("Hardware decode ON" if self._hw_decode else "Software decode (CPU)")
+        self.update()
+
+    def _paste_pc_clipboard(self):
+        if not self._control_ready():
+            self._hint("Turn on iPhone control first (Ctrl+U)")
+            return
+        text = QApplication.clipboard().text()
+        if not text:
+            self._hint("PC clipboard is empty")
+            return
+
+        def done(ok: bool = True):
+            msg = "Sent clipboard to iPhone" if ok else "Could not update iPhone clipboard"
+            if self._bridge is not None:
+                self._bridge.hint.emit(msg)
+
+        self.ctrl.set_pasteboard(text, on_done=done)
+        self._hint("Sending clipboard to iPhone...")
+
+    def _copy_phone_clipboard(self):
+        if not self._control_ready():
+            self._hint("Turn on iPhone control first (Ctrl+U)")
+            return
+
+        def got(text):
+            if self._bridge is not None:
+                self._bridge.pasteboard.emit("" if text is None else str(text))
+
+        self.ctrl.get_pasteboard(got)
+        self._hint("Reading iPhone clipboard...")
+
+    def on_phone_pasteboard(self, text: str):
+        if not text:
+            self._hint("iPhone clipboard is empty")
+            return
+        QApplication.clipboard().setText(text)
+        self._hint(f"Copied from iPhone ({len(text)} chars)")
+
+    def _set_control_mode(self, mode: str):
+        self.settings["control_mode"] = mode
+        self.settings.save()
+        if self.ctrl is not None:
+            self.ctrl.control_mode = mode
+            if self.ctrl.active:
+                self.ctrl.stop()
+        names = {"auto": "Auto (USB -> WDA)", "native": "Zero-App USB", "wda": "WebDriverAgent"}
+        self._hint(f"Control mode: {names.get(mode, mode)}")
+
+    def _reveal_dev_mode(self):
+        import threading
+
+        self._hint("Checking USB iPhone for Developer Mode...")
+
+        def worker():
+            from .control import usb
+
+            try:
+                dev_name = usb.reveal_developer_mode()
+                msg = f"Developer Mode shown on {dev_name}: enable in Settings -> Privacy & Security"
+            except usb.UsbError as exc:
+                msg = str(exc).splitlines()[0]
+            except Exception as exc:
+                msg = f"Reveal Developer Mode failed: {exc}"
+            if self._bridge is not None:
+                self._bridge.hint.emit(msg)
+
+        threading.Thread(target=worker, name="reveal-dev-mode", daemon=True).start()
 
     def _rename(self):
         from PySide6.QtWidgets import QInputDialog
@@ -1025,6 +1478,9 @@ class PhoneWindow(QWidget):
 
     def _toggle_mute(self):
         if self.rx:
+            if not getattr(self.rx, "has_audio", True):
+                self._hint("USB stream has no audio on Windows")
+                return
             self.rx.set_muted(not self.rx.muted)
             self._hint("Sound off" if self.rx.muted else "Sound on")
 
@@ -1034,7 +1490,7 @@ class PhoneWindow(QWidget):
         if LOG_FILE.exists():
             os.startfile(str(LOG_FILE))
 
-    def screenshot(self):
+    def screenshot(self, to_clipboard: bool = False):
         frame = getattr(self.rx.decoder, "last_frame", None) if self.rx else None
         if frame is None:
             self._hint("Nothing to save yet")
@@ -1042,6 +1498,10 @@ class PhoneWindow(QWidget):
         try:
             arr = frame.to_ndarray(format="bgra")
             img = QImage(arr.data, arr.shape[1], arr.shape[0], arr.strides[0], QImage.Format_RGB32).copy()
+            if to_clipboard:
+                QApplication.clipboard().setImage(img)
+                self._hint("Screenshot copied to clipboard")
+                return
             folder = Path.home() / "Pictures" / "iPhone Mirror"
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / time.strftime("iPhone %Y-%m-%d %H-%M-%S.png")
@@ -1062,6 +1522,8 @@ class PhoneWindow(QWidget):
 
     def closeEvent(self, e):
         self._save_pos()
+        if self.recorder and self.recorder.recording:
+            self.recorder.stop()
         super().closeEvent(e)
 
     # ------------------------------------------------------------ tray

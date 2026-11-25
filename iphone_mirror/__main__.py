@@ -14,20 +14,22 @@ from . import net
 from .airplay import Receiver
 from .config import APP_DIR, LOG_FILE, SETTINGS_FILE, Settings
 from .control import OFF, Controller
+from .recorder import ScreenRecorder
 from .ui import Bridge, PhoneWindow
+from .usbvideo import UsbReceiver
 
 INSTANCE_KEY = "iPhoneMirror-single-instance"
 LOCAL_PORT = 7100  # --local self-tests must not collide with a normal instance on port 7000
 LOCAL_SETTINGS = APP_DIR / "settings-local.json"  # ... nor overwrite its settings
 
 
-def setup_logging():
+def setup_logging(debug: bool = False):
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
     fh.setFormatter(fmt)
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
     root.addHandler(fh)
     if sys.stderr:
         sh = logging.StreamHandler()
@@ -46,12 +48,36 @@ def parse_args():
     )
     p.add_argument("--port", type=int, help=f"RTSP port (default {net.PORT}, or {LOCAL_PORT} with --local)")
     p.add_argument("--control", action="store_true", help="start iPhone control (USB / WebDriverAgent) at launch")
+    p.add_argument("--source", choices=("airplay", "usb"), help="video source (airplay or iOS 27+ usb cable)")
+    p.add_argument("--hw-decode", action="store_true", help="enable GPU hardware video decoding")
+    p.add_argument("--no-hw-decode", action="store_true", help="disable GPU hardware video decoding")
+    p.add_argument("--debug", action="store_true", help="write detailed debug messages to log and stderr")
     p.add_argument("--grab", metavar="DIR", help="self-test: save a PNG of the window every 2 s")
     p.add_argument("--quit-after", type=float, default=0, help="self-test: exit after N seconds")
     return p.parse_args()
 
 
+def _maybe_run_internal_helper():
+    """Run bundled CLI helpers when invoked from a frozen PyInstaller executable."""
+    if len(sys.argv) < 2:
+        return None
+    cmd = sys.argv[1]
+    if cmd == "--internal-pmd3":
+        from pymobiledevice3.__main__ import main as pmd3_main
+
+        sys.argv = ["pymobiledevice3", *sys.argv[2:]]
+        return int(pmd3_main() or 0)
+    if cmd == "--internal-wifi-wda":
+        from .control.wifi_wda import main as wifi_wda_main
+
+        return int(wifi_wda_main() or 0)
+    return None
+
+
 def main():
+    helper_rc = _maybe_run_internal_helper()
+    if helper_rc is not None:
+        return helper_rc
     args = parse_args()
     if args.local:
         net.BIND_HOST = "127.0.0.1"
@@ -59,7 +85,7 @@ def main():
         net.PORT = LOCAL_PORT
     if args.port:
         net.PORT = args.port
-    setup_logging()
+    setup_logging(debug=args.debug)
     app = QApplication(sys.argv[:1])
     app.setApplicationName("iPhone Mirror")
 
@@ -77,24 +103,58 @@ def main():
         instance.listen(INSTANCE_KEY)
 
     settings = Settings(LOCAL_SETTINGS if args.local else SETTINGS_FILE)
+    if args.source:
+        settings["source"] = args.source
+    if args.no_hw_decode:
+        settings["hw_decode"] = False
+    elif args.hw_decode:
+        settings["hw_decode"] = True
+    source = settings.get("source", "airplay")
+    hw_decode = bool(settings.get("hw_decode", False)) and not args.no_hw_decode
+    from .fairplay.playfair import playfair_decrypt
+    from .stream_ops import avcc_to_annexb
+
+    rust_fp = playfair_decrypt.__module__.startswith("fairplay_rs")
+    rust_ops = avcc_to_annexb.__module__.startswith("stream_ops_rs")
     logging.info(
-        "starting, name=%r, port=%d, local=%s, pid=%d", settings["name"], net.PORT, args.local, os.getpid()
+        "starting, name=%r, port=%d, source=%s, hw_decode=%s, rust_fp=%s, rust_ops=%s, local=%s, pid=%d",
+        settings["name"],
+        net.PORT,
+        source,
+        hw_decode,
+        rust_fp,
+        rust_ops,
+        args.local,
+        os.getpid(),
     )
     bridge = Bridge()
     # Controller.on_state runs on the control thread: hand it to the GUI thread via a queued signal
     ctrl = Controller(on_state=lambda state, message: bridge.control.emit(state, message))
-    win = PhoneWindow(settings, None, ctrl)
-    rx = Receiver(
-        settings,
-        on_frame=lambda arr, w, h: bridge.frame.emit(arr, w, h),
-        on_event=lambda e, info: bridge.event.emit(e, info),
-    )
+    ctrl.control_mode = settings.get("control_mode", "auto")
+    recorder = ScreenRecorder(fps=int(settings.get("fps") or 30))
+
+    def make_receiver(src: str, use_hw: bool):
+        cls = UsbReceiver if src == "usb" else Receiver
+        r = cls(
+            settings,
+            on_frame=lambda arr, w, h: bridge.frame.emit(arr, w, h),
+            on_event=lambda e, info: bridge.event.emit(e, info),
+            hw_decode=use_hw,
+            on_raw_frame=recorder.push_video,
+            on_audio_pcm=recorder.push_audio,
+        )
+        if args.local and hasattr(r, "muted"):
+            r.muted = True  # self-test: decode audio but keep the speakers silent
+        return r
+
+    win = PhoneWindow(settings, None, ctrl, receiver_factory=make_receiver, recorder=recorder, bridge=bridge)
+    rx = make_receiver(source, hw_decode)
     win.rx = rx
-    if args.local:
-        rx.muted = True  # self-test: decode audio but keep the speakers silent
     bridge.frame.connect(win.on_frame)
     bridge.event.connect(win.on_event)
     bridge.control.connect(win.on_control)
+    bridge.pasteboard.connect(win.on_phone_pasteboard)
+    bridge.hint.connect(win._hint)
     if instance is not None:
         instance.newConnection.connect(lambda: (instance.nextPendingConnection(), win._show_front()))
     win.show()
@@ -119,11 +179,16 @@ def main():
     settings.save()
     try:
         bridge.control.disconnect(win.on_control)  # the window is going away
+        bridge.pasteboard.disconnect(win.on_phone_pasteboard)
+        bridge.hint.disconnect(win._hint)
     except (RuntimeError, TypeError):
         pass
+    if recorder.recording:
+        recorder.stop()
     if ctrl.state != OFF:
         ctrl.stop()
-    rx.stop()
+    if win.rx is not None:
+        win.rx.stop()
     logging.info("exit")
     return code
 

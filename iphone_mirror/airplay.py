@@ -1,11 +1,16 @@
 """AirPlay screen-mirroring receiver: RTSP control connection and session setup."""
 import asyncio
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import logging
 import plistlib
 import struct
 import threading
 import time
+
+# Python 3.15 PEP 810 lazy_import compat (PR #5)
+concurrent.futures.ThreadPoolExecutor = ThreadPoolExecutor
 
 from . import discovery, net
 from .audio import AudioStream, Player
@@ -21,6 +26,17 @@ NTP_EPOCH = 2208988800
 
 def _bplist(obj) -> bytes:
     return plistlib.dumps(obj, fmt=plistlib.FMT_BINARY, sort_keys=False)
+
+
+def _describe_plist(obj, depth=0):
+    """Short summary of a request plist for DEBUG logs: bytes replaced by length only."""
+    if isinstance(obj, dict):
+        return {k: _describe_plist(v, depth + 1) for k, v in obj.items()} if depth < 4 else "{...}"
+    if isinstance(obj, list):
+        return [_describe_plist(v, depth + 1) for v in obj] if depth < 4 else "[...]"
+    if isinstance(obj, (bytes, bytearray)):
+        return f"<{len(obj)} bytes>"
+    return obj
 
 
 class Request:
@@ -47,7 +63,8 @@ class Response:
 
 class _TimingProto(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
-        pass  # replies are not needed: we render as soon as frames arrive
+        # replies are not needed: we render as soon as frames arrive
+        log.debug("timing reply from %s:%s (%d bytes)", addr[0], addr[1], len(data))
 
 
 class TimingSender:
@@ -274,6 +291,8 @@ class Connection:
     async def on_setup(self, req, resp):
         rx = self.rx
         plist = plistlib.loads(req.body) if req.body else {}
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("SETUP plist: %s", _describe_plist(plist))
         out = {}
         if "ekey" in plist and "eiv" in plist:
             self.client_name = plist.get("name") or "iPhone"
@@ -314,7 +333,9 @@ class Connection:
                     if player is None:
                         res_streams.append({"dataPort": 0, "controlPort": 0, "type": 96})
                         continue
-                    self.audio = AudioStream(self.aeskey, self.aesiv, ct, player)
+                    self.audio = AudioStream(
+                        self.aeskey, self.aesiv, ct, player, on_pcm=getattr(rx, "on_audio_pcm", None)
+                    )
                     dport, cport = await self.audio.start()
                     res_streams.append({"dataPort": dport, "controlPort": cport, "type": 96})
                 else:
@@ -372,12 +393,13 @@ class Connection:
 class Receiver:
     """Runs the AirPlay receiver on its own asyncio thread."""
 
-    def __init__(self, settings, on_frame, on_event):
+    def __init__(self, settings, on_frame, on_event, hw_decode=False, on_raw_frame=None, on_audio_pcm=None):
         self.settings = settings
         self.identity = ServerIdentity(settings["ed25519_seed"])
         self.pk_hex = self.identity.public.hex()
         self.on_event = on_event
-        self.decoder = VideoDecoder(on_frame)
+        self.on_audio_pcm = on_audio_pcm
+        self.decoder = VideoDecoder(on_frame, hw_decode=hw_decode, on_raw_frame=on_raw_frame)
         self.player = None
         self.volume_db = 0.0
         self.muted = False
@@ -387,6 +409,20 @@ class Receiver:
         self._mirror_owner = None
         self._thread = None
         self._server = None
+        self._did_stop = False
+
+    def stats(self) -> dict:
+        owner = self._mirror_owner
+        mirror = getattr(owner, "mirror", None) if owner is not None else None
+        return {
+            "source": "AirPlay",
+            "active_codec": self.decoder.active_codec,
+            "hw_active": self.decoder.hw_active,
+            "decode_ms": self.decoder.decode_ms,
+            "dropped_frames": self.decoder.dropped_frames,
+            "bitrate_kbps": mirror.bitrate_kbps if mirror is not None else 0.0,
+            "audio_buffer_ms": self.player.buffered_ms if self.player is not None else 0.0,
+        }
 
     def emit(self, event, **info):
         try:
@@ -445,6 +481,17 @@ class Receiver:
         except Exception:
             log.exception("receiver crashed")
             self.emit("error", message="The AirPlay server crashed. See the log for details.")
+        finally:
+            try:
+                pending = [t for t in asyncio.all_tasks(self.loop) if not t.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            self.loop.close()
 
     async def _main(self):
         handler = lambda r, w: Connection(self, r, w).serve()  # noqa: E731
@@ -484,6 +531,9 @@ class Receiver:
         self.loop.call_soon_threadsafe(lambda: self.loop.run_in_executor(None, reannounce))
 
     def stop(self):
+        if self._did_stop:
+            return
+        self._did_stop = True
         logging.getLogger("asyncio").setLevel(logging.CRITICAL)  # pending accept tasks at exit are harmless
         if self.advertiser:
             try:
@@ -495,8 +545,31 @@ class Receiver:
         self.decoder.stop()
         if self.loop and self.loop.is_running():
             async def shutdown():
-                if self._server:
+                owner = self._mirror_owner
+                if owner is not None:
+                    try:
+                        await asyncio.wait_for(owner.cleanup(), timeout=1)
+                    except Exception:
+                        log.exception("mirror close failed")
+                    writer = getattr(owner, "writer", None)
+                    if writer is not None:
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                current = asyncio.current_task()
+                tasks = [t for t in asyncio.all_tasks(self.loop) if t is not current and not t.done()]
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                if self._server is not None:
                     self._server.close()
+                    try:
+                        await asyncio.wait_for(self._server.wait_closed(), timeout=1)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0)
                 self.loop.stop()
 
             asyncio.run_coroutine_threadsafe(shutdown(), self.loop)

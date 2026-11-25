@@ -6,9 +6,9 @@ import threading
 
 import av
 import numpy as np
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from . import net
+from .stream_ops import decrypt_audio_rtp, scale_pcm_i16
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,11 @@ class Player:
             self._stream.start()
         except Exception as e:
             log.error("audio output unavailable: %s", e)
+
+    @property
+    def buffered_ms(self) -> float:
+        with self._lock:
+            return round(self._buffered * 1000.0 / RATE, 1)
 
     def close(self):
         if self._stream is not None:
@@ -91,8 +96,9 @@ class Player:
                 self._started = False
         if self.muted:
             outdata.fill(0)
-        elif self.gain < 0.999:
-            np.multiply(outdata, self.gain, out=outdata, casting="unsafe")
+        elif pos > 0 and self.gain < 0.999:
+            scaled = scale_pcm_i16(outdata[:pos].tobytes(), float(self.gain))
+            outdata[:pos] = np.frombuffer(scaled, dtype=np.int16).reshape(-1, 2)
 
 
 class _Proto(asyncio.DatagramProtocol):
@@ -107,10 +113,11 @@ class _Proto(asyncio.DatagramProtocol):
 
 
 class AudioStream:
-    def __init__(self, aeskey: bytes, aesiv: bytes, ct: int, player: Player):
+    def __init__(self, aeskey: bytes, aesiv: bytes, ct: int, player: Player, on_pcm=None):
         self.key, self.iv = aeskey, aesiv
         self.ct = ct
         self.player = player
+        self.on_pcm = on_pcm
         self.data_port = self.control_port = 0
         self._transports = []
         self._last_seq = None
@@ -150,18 +157,15 @@ class AudioStream:
             self._data(pkt[4:])
 
     def _data(self, pkt: bytes):
-        if len(pkt) < 12:
+        res = decrypt_audio_rtp(
+            self.key,
+            self.iv,
+            pkt,
+            -1 if self._last_seq is None else self._last_seq,
+        )
+        if res is None:
             return
-        seq = int.from_bytes(pkt[2:4], "big")
-        if self._last_seq is not None:
-            diff = (seq - self._last_seq) & 0xFFFF
-            if diff == 0 or diff > 0x8000:  # duplicate or late
-                return
-        self._last_seq = seq
-        payload = pkt[12:]
-        n = len(payload) // 16 * 16
-        dec = Cipher(algorithms.AES(self.key), modes.CBC(self.iv)).decryptor()
-        clear = dec.update(payload[:n]) + payload[n:]
+        self._last_seq, clear = res
         try:
             frames = self.codec.decode(av.Packet(clear))
         except av.error.FFmpegError as e:
@@ -174,3 +178,8 @@ class AudioStream:
                     log.info("audio decoding OK (%d samples/packet, peak %d)", len(pcm), int(np.abs(pcm).max()))
                 self._decoded += 1
                 self.player.write(pcm)
+                if self.on_pcm is not None:
+                    try:
+                        self.on_pcm(pcm, RATE)
+                    except Exception:
+                        log.exception("audio pcm callback failed")

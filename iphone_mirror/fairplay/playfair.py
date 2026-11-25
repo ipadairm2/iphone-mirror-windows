@@ -364,3 +364,25 @@ def playfair_decrypt(message3: bytes, cipher_text: bytes) -> bytes:
     cycle(block, sched)
     key = _xor16(block, chunk1)
     return bytes(z_xor(x_xor(key)))
+# >>> rust-anything: fairplay-rs is on. `rust-anything disable ../../rust/fairplay-rs` removes this block.
+def _rust_anything_fairplay_rs():
+    import importlib, os, sys
+    mode = os.environ.get("RUST_ANYTHING_MODE")
+    if mode == "old" or os.environ.get("RUST_ANYTHING_UNIT_FAIRPLAY") == "original":
+        return
+    at = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../rust/fairplay-rs/python"))
+    sys.path.insert(0, at)
+    try:
+        native = importlib.import_module("fairplay_rs")
+    except ImportError:
+        if mode == "new":
+            raise
+        return
+    finally:
+        sys.path.remove(at)
+    globals().update({name: getattr(native, name) for name in ["z_xor", "x_xor", "generate_key_schedule", "decrypt_message", "modified_md5", "sap_hash", "generate_session_key", "playfair_decrypt"]})
+
+
+_rust_anything_fairplay_rs()
+del _rust_anything_fairplay_rs
+# <<< rust-anything: fairplay-rs

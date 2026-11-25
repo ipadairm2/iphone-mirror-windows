@@ -4,6 +4,8 @@ import socket
 
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
+from .stream_ops import encode_txt_records
+
 log = logging.getLogger(__name__)
 
 MODEL = "AppleTV3,2"
@@ -53,12 +55,7 @@ def raop_txt(pk_hex: str) -> dict:
 
 def txt_bytes(txt: dict) -> bytes:
     """DNS TXT rdata encoding (used in GET /info "txtAirPlay")."""
-    out = bytearray()
-    for k, v in txt.items():
-        item = f"{k}={v}".encode()
-        out.append(len(item))
-        out += item
-    return bytes(out)
+    return encode_txt_records(list(txt.keys()), [str(v) for v in txt.values()])
 
 
 def local_ipv4_addresses():

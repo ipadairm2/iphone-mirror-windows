@@ -1,0 +1,247 @@
+{
+  "schema": "rust-anything/bridge@1",
+  "root": "C:\\Users\\minhk\\OneDrive\\Documents\\HOCTHEM\\iphone-mirror-windows",
+  "unit": "iphone_mirror/fairplay/",
+  "language": "python",
+  "kind": "pyo3",
+  "crate_name": "fairplay-rs",
+  "exports": [
+    {
+      "name": "z_xor",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 23,
+      "params": [
+        {
+          "name": "block",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "x_xor",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 27,
+      "params": [
+        {
+          "name": "block",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "generate_key_schedule",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 108,
+      "params": [
+        {
+          "name": "key_material",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "decrypt_message",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 161,
+      "params": [
+        {
+          "name": "message_in",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "modified_md5",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 243,
+      "params": [
+        {
+          "name": "block_in",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "key_in",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "sap_hash",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 289,
+      "params": [
+        {
+          "name": "block_in",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "generate_session_key",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 333,
+      "params": [
+        {
+          "name": "old_sap",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "message_in",
+          "ts_type": "unknown",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "unknown",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "playfair_decrypt",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 355,
+      "params": [
+        {
+          "name": "message3",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "cipher_text",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    }
+  ],
+  "classes": [],
+  "js_only": [
+    {
+      "name": "FairPlay",
+      "file": "iphone_mirror/fairplay/__init__.py",
+      "line": 6,
+      "reason": "class: public attribute `keymsg`"
+    },
+    {
+      "name": "L",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 112,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "U",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 117,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "rol8",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 158,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "rol8x",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 164,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "weird_ror8",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 170,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "weird_rol8",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 178,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "weird_rol32",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 186,
+      "reason": "internal CInt helper"
+    },
+    {
+      "name": "CInt",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 11,
+      "reason": "class: public attribute `u`, public attribute `v`, special method `__add__`, special method `__and__`, special method `__index__`, special method `__invert__`, special method `__lshift__`, special method `__mod__`, special method `__mul__`, special method `__neg__`, special method `__or__`, special method `__radd__`, special method `__repr__`, special method `__rmul__`, special method `__rshift__`, special method `__rsub__`, special method `__sub__`, special method `__truediv__`, special method `__xor__`"
+    },
+    {
+      "name": "UCharBuf",
+      "file": "iphone_mirror/fairplay/_cint.py",
+      "line": 122,
+      "reason": "class: public attribute `b`, public attribute `written`, special method `__getitem__`, special method `__setitem__`"
+    },
+    {
+      "name": "garble",
+      "file": "iphone_mirror/fairplay/_garble.py",
+      "line": 8,
+      "reason": "internal CInt buffer helper"
+    },
+    {
+      "name": "cycle",
+      "file": "iphone_mirror/fairplay/playfair.py",
+      "line": 136,
+      "reason": "mutates bytearray in-place"
+    }
+  ]
+}

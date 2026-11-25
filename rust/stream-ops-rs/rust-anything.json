@@ -1,0 +1,204 @@
+{
+  "schema": "rust-anything/bridge@1",
+  "root": "C:\\Users\\minhk\\OneDrive\\Documents\\HOCTHEM\\iphone-mirror-windows",
+  "unit": "iphone_mirror/stream_ops/",
+  "language": "python",
+  "kind": "pyo3",
+  "crate_name": "stream-ops-rs",
+  "exports": [
+    {
+      "name": "avcc_to_annexb",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 11,
+      "params": [
+        {
+          "name": "data",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes | undefined",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "decrypt_mirror_nal",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 27,
+      "params": [
+        {
+          "name": "key",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "iv",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "offset",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "payload",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes | undefined",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "parse_avcc_config",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 45,
+      "params": [
+        {
+          "name": "payload",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes | undefined",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "decrypt_audio_rtp",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 62,
+      "params": [
+        {
+          "name": "key",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "iv",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "pkt",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "last_seq",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "tuple | undefined",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "scale_pcm_i16",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 83,
+      "params": [
+        {
+          "name": "pcm",
+          "ts_type": "pybytes",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "gain",
+          "ts_type": "number",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "visible_size",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 103,
+      "params": [
+        {
+          "name": "frame_w",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "frame_h",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "vis_w",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "vis_h",
+          "ts_type": "int",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "tuple",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    },
+    {
+      "name": "encode_txt_records",
+      "file": "iphone_mirror/stream_ops/__init__.py",
+      "line": 115,
+      "params": [
+        {
+          "name": "keys",
+          "ts_type": "string[]",
+          "optional": false,
+          "rest": false
+        },
+        {
+          "name": "values",
+          "ts_type": "string[]",
+          "optional": false,
+          "rest": false
+        }
+      ],
+      "returns": "pybytes",
+      "is_async": false,
+      "is_generator": false,
+      "type_params": [],
+      "uses_instanceof": false
+    }
+  ],
+  "classes": [],
+  "js_only": []
+}

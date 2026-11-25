@@ -21,6 +21,12 @@ DEFAULTS = {
     "fps": 60,
     "audio": True,
     "always_on_top": True,
+    "hw_decode": False,
+    "settings_version": 2,
+    "opacity": 1.0,
+    "show_hud": False,
+    "source": "airplay",
+    "control_mode": "auto",
     # window geometry (logical pixels); 0 = automatic
     "x": None,
     "y": None,
@@ -36,12 +42,19 @@ class Settings:
         self.path = path
         self.data = dict(DEFAULTS, name=default_name)
         APP_DIR.mkdir(parents=True, exist_ok=True)
+        loaded = None
         if path.exists():
             try:
-                self.data.update(json.loads(path.read_text(encoding="utf-8")))
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                self.data.update(loaded)
             except Exception as e:  # corrupt file: keep defaults, rewrite
                 log.warning("settings.json unreadable (%s), using defaults", e)
         changed = False
+        if isinstance(loaded, dict) and int(loaded.get("settings_version") or 1) < 2:
+            # v1 defaulted hw_decode=True which failed on real iOS/iPadOS VideoToolbox streams
+            self.data["hw_decode"] = False
+            self.data["settings_version"] = 2
+            changed = True
         if not self.data.get("name"):
             self.data["name"] = socket.gethostname() or "Windows PC"
             changed = True

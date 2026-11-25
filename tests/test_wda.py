@@ -43,6 +43,7 @@ class MockWDA:
         self.fail = {}  # session sub-path -> (HTTP status, W3C error), answered once
         self.drop_next = False  # close the connection without answering, once
         self.status_value = {"ready": True, "ios": {"ip": "10.0.0.2"}}
+        self.pasteboard = ""
         self.dead = False
         self.client_ports = set()
         mock_wda = self
@@ -104,6 +105,11 @@ class MockWDA:
                     return status, {"value": {"error": err, "message": "mock failure"}}
                 if rest == "/window/size":
                     return 200, {"value": {"width": self.size[0], "height": self.size[1]}}
+                if rest == "/wda/setPasteboard":
+                    self.pasteboard = (body or {}).get("content", "")
+                    return 200, {"value": None, "sessionId": sid}
+                if rest == "/wda/getPasteboard":
+                    return 200, {"value": self.pasteboard, "sessionId": sid}
                 return 200, {"value": None, "sessionId": sid}
             return 404, {"value": {"error": "unknown command", "message": f"unhandled {method} {path}"}}
 
@@ -301,6 +307,29 @@ class WDAClientTests(unittest.TestCase):
         self.assertFalse(usb.wda_ready(self.mock.url))
         self.mock.status_value = {"ready": False}
         self.assertFalse(usb.wda_ready(self.mock.url))
+
+    def test_window_size_retries_stale_element(self):
+        from iphone_mirror.control import wda as wda_mod
+
+        self.mock.fail["/window/size"] = (404, "stale element reference")
+        with mock.patch.object(wda_mod, "SIZE_RETRY_S", 0.01):
+            self.assertEqual(self.wda.window_size(), (390.0, 844.0))
+        self.assertEqual(len(self.mock.find("GET", "/window/size")), 2)
+
+    def test_lock_unlock_shake(self):
+        self.wda.lock()
+        self.wda.unlock()
+        self.wda.shake()
+        self.assertEqual(len(self.mock.find("POST", "/wda/lock")), 1)
+        self.assertEqual(len(self.mock.find("POST", "/wda/unlock")), 1)
+        self.assertEqual(len(self.mock.find("POST", "/wda/shake")), 1)
+
+    def test_pasteboard_roundtrip(self):
+        text = "Xin ch\u00e0o \U0001f4f1 line2"
+        self.wda.set_pasteboard(text)
+        self.assertEqual(self.wda.get_pasteboard(), text)
+        self.assertEqual(len(self.mock.find("POST", "/wda/setPasteboard")), 1)
+        self.assertEqual(len(self.mock.find("POST", "/wda/getPasteboard")), 1)
 
 
 # ---------------------------------------------------------------------- Controller
@@ -546,6 +575,29 @@ class ControllerTests(unittest.TestCase):
             self.wait_state(ctrl, ERROR, timeout=20)
             self.assertEqual(ctrl.message, control.MSG_LOST)
 
+    def test_horizontal_scroll_and_pasteboard_callbacks(self):
+        ctrl = self.controller()
+        ctrl.start()
+        self.wait_state(ctrl, READY)
+
+        ctrl.scroll(0.5, 0.4, 2.0, axis="x")
+        self.assertTrue(wait_for(lambda: len(self.mock.pointer_actions()) >= 1))
+        steps = self.mock.pointer_actions()[-1]["actions"]
+        self.assertEqual(steps[0]["y"], steps[2]["y"])
+        self.assertNotEqual(steps[0]["x"], steps[2]["x"])
+
+        done = threading.Event()
+        ok_vals = []
+        ctrl.set_pasteboard("hello clip", on_done=lambda ok: (ok_vals.append(ok), done.set()))
+        self.assertTrue(done.wait(timeout=3.0))
+        self.assertEqual(ok_vals, [True])
+
+        got = threading.Event()
+        got_vals = []
+        ctrl.get_pasteboard(lambda text: (got_vals.append(text), got.set()))
+        self.assertTrue(got.wait(timeout=3.0))
+        self.assertEqual(got_vals, ["hello clip"])
+
 
 # ---------------------------------------------------------------------- USB helpers
 def _zip_bytes(entries):
@@ -620,6 +672,19 @@ class UsbTests(unittest.TestCase):
             with self.assertRaises(usb.UsbError):
                 self.download(data, dest)
             self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_download_wda_ipa_excludes_dsym(self):
+        app = self.APP
+        data = _zip_bytes([
+            (app + "Info.plist", b"<plist/>", 0o100644),
+            ("WebDriverAgentRunner-Runner.app.dSYM/Contents/Info.plist", b"dsym", None),
+            (app + "Foo.dSYM/Contents/Resources/DWARF/Foo", b"dwarf", None),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "WDA.ipa"
+            path = self.download(data, dest)
+            with zipfile.ZipFile(path) as ipa:
+                self.assertEqual(sorted(ipa.namelist()), ["Payload/WebDriverAgentRunner-Runner.app/Info.plist"])
 
     def test_children_never_use_pythonw(self):
         with tempfile.TemporaryDirectory() as tmp:

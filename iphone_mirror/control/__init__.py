@@ -27,6 +27,8 @@ import time
 from .usb import WDA_PORT, Cancelled, UsbError, UsbSession, wda_ready
 from .wda import WDA, WDAError
 
+_REAL_USB_SESSION = UsbSession
+
 log = logging.getLogger(__name__)
 
 OFF, STARTING, READY, ERROR = "off", "starting", "ready", "error"
@@ -77,17 +79,23 @@ class Controller:
         # rotates, the video turns at once, while WDA's cached screen size would only be
         # re-read after IDLE_CHECK seconds without input.
         self.screen_aspect = None
+        self.control_mode = "auto"  # "auto", "native", "wda"
+        self.backend_name = ""
         self.wda = None
         self._lock = threading.RLock()
         self._run = None
         self._thread = None
-        self._scroll_carry = (0.0, 0.0)  # (notches not scrolled yet, time)
+        self._scroll_carry = (0.0, 0.0, "y")  # (notches not scrolled yet, time, axis)
         self._size_checked = 0.0  # time of the last orientation-driven size refresh
         self._serial = 0  # number of announced state changes
 
     @property
     def active(self):
         return self.state in (STARTING, READY)
+
+    @property
+    def supports_live_touch(self) -> bool:
+        return bool(getattr(self.wda, "live_touch", False))
 
     def snapshot(self):
         """(state, message, serial) read together. serial goes up with every announced change,
@@ -140,23 +148,52 @@ class Controller:
     def _main(self, run):
         wda = None
         try:
-            self._set(STARTING, "Looking for WebDriverAgent...", run)
-            self._scroll_carry = (0.0, 0.0)
+            from .usb import com_mta
+
+            com_mta()
+            self._set(STARTING, "Looking for iPhone control...", run)
+            self._scroll_carry = (0.0, 0.0, "y")
             self._size_checked = 0.0
-            url = self._find_running()
-            if not url:
-                usb = UsbSession()
-                if not run.attach(usb):
-                    return
-                url = usb.bring_up(progress=lambda m: self._set(STARTING, m, run))
-            wda = WDA(url)
-            wda.new_session()
+            mode = self.control_mode
+            url = self._find_running() if mode != "native" else None
+            cached_devices = None
+            if not url and mode in ("auto", "native") and UsbSession is _REAL_USB_SESSION:
+                try:
+                    from .hid import NativeHidUnavailable, bring_up_native_hid
+
+                    hid_client = bring_up_native_hid(
+                        progress=lambda m: self._set(STARTING, m, run),
+                        cancel=run.stop,
+                    )
+                    if not run.attach(hid_client):
+                        hid_client.close()
+                        return
+                    wda = hid_client
+                except NativeHidUnavailable as exc:
+                    cached_devices = getattr(exc, "devices", None)
+                    if mode == "native":
+                        raise UsbError(str(exc)) from None
+            if wda is None:
+                if not url:
+                    usb = UsbSession()
+                    if not run.attach(usb):
+                        return
+                    kwargs = {"devices": cached_devices} if cached_devices is not None else {}
+                    url = usb.bring_up(progress=lambda m: self._set(STARTING, m, run), **kwargs)
+                wda = WDA(url)
+                wda.new_session()
             w, h = wda.window_size()
+            backend = getattr(wda, "backend_name", "")
             with self._lock:
                 if run is not self._run or run.stop.is_set():
                     return
                 self.wda = wda
-                self._set(READY, f"Control ready ({w:.0f}x{h:.0f} pt)", run)
+                self.backend_name = backend or "WebDriverAgent"
+                if backend:
+                    ready_msg = f"Control ready ({backend}, {w:.0f}x{h:.0f} pt)"
+                else:
+                    ready_msg = f"Control ready ({w:.0f}x{h:.0f} pt)"
+                self._set(READY, ready_msg, run)
             self._loop(run, wda)
         except Cancelled:
             pass
@@ -195,12 +232,18 @@ class Controller:
                 if run.stop.is_set():
                     return
                 log.warning("command %s failed: %s", cmd[0], e)
-                if not wda_ready(wda.base):
-                    raise WDAError(MSG_LOST) from None
+                alive = wda.is_alive() if hasattr(wda, "is_alive") else wda_ready(wda.base)
+                if not alive:
+                    raise WDAError(MSG_LOST if not hasattr(wda, "is_alive") else "Lost USB control connection. Enable control again.") from None
 
     def _idle_check(self, run, wda):
-        """No input for a while: make sure WDA is still there and re-read the screen size
-        (it swaps when the phone rotates)."""
+        """No input for a while: make sure WDA / USB HID is still there and re-read screen size."""
+        if hasattr(wda, "is_alive"):
+            if not wda.is_alive():
+                raise WDAError("Lost USB control connection. Enable control again.")
+            if hasattr(wda, "set_aspect") and self.screen_aspect:
+                wda.set_aspect(self.screen_aspect)
+            return
         usb = run.usb
         if usb is not None:
             usb.check()  # UsbError if the WDA runner or the port forwarder exited
@@ -215,9 +258,9 @@ class Controller:
 
     @staticmethod
     def _coalesce(q, cmd, held):
-        """Merge queued key presses / wheel notches into one WDA request."""
+        """Merge queued key presses / wheel notches / live touch moves into one request."""
         kind = cmd[0]
-        if kind not in ("type", "scroll"):
+        if kind not in ("type", "scroll", "touch_contact"):
             return cmd
         while True:
             try:
@@ -225,11 +268,14 @@ class Controller:
             except queue.Empty:
                 return cmd
             if nxt is not None and nxt[0] == kind:
+                if kind == "touch_contact":
+                    cmd = nxt
+                    continue
                 if kind == "type":
                     cmd = ("type", cmd[1] + nxt[1])
                     continue
-                if abs(nxt[1] - cmd[1]) < 0.05 and abs(nxt[2] - cmd[2]) < 0.05:
-                    cmd = ("scroll", cmd[1], cmd[2], cmd[3] + nxt[3])
+                if abs(nxt[1] - cmd[1]) < 0.05 and abs(nxt[2] - cmd[2]) < 0.05 and nxt[4:] == cmd[4:]:
+                    cmd = (cmd[0], cmd[1], cmd[2], cmd[3] + nxt[3], *cmd[4:])
                     continue
             held.append(nxt)
             return cmd
@@ -262,9 +308,9 @@ class Controller:
     def swipe(self, x1f, y1f, x2f, y2f, seconds):
         self._put("swipe", x1f, y1f, x2f, y2f, seconds)
 
-    def scroll(self, xf, yf, amount):
-        """amount in wheel notches; > 0 = wheel away from you = content moves down (finger drags down)."""
-        self._put("scroll", xf, yf, amount)
+    def scroll(self, xf, yf, amount, axis="y"):
+        """amount in wheel notches; y > 0 moves content down, x > 0 moves content right."""
+        self._put("scroll", xf, yf, amount, axis)
 
     def type_text(self, text):
         """'\\b' = backspace, '\\n' = return ('\\r' and '\\r\\n' are taken as return too)."""
@@ -281,13 +327,39 @@ class Controller:
         """name: volumeUp, volumeDown, home."""
         self._put("button", name)
 
+    def lock(self):
+        self._put("lock")
+
+    def unlock(self):
+        self._put("unlock")
+
+    def touch_contact(self, xf, yf):
+        self._put("touch_contact", xf, yf)
+
+    def touch_release(self, xf, yf):
+        self._put("touch_release", xf, yf)
+
+    def rotate(self, direction: str = "left"):
+        self._put("rotate", direction)
+
+    def shake(self):
+        self._put("shake")
+
+    def set_pasteboard(self, text: str, on_done=None):
+        self._put("set_pasteboard", text, on_done)
+
+    def get_pasteboard(self, on_result):
+        self._put("get_pasteboard", on_result)
+
     # ---- execution (control thread)
     def _screen_size(self, wda):
         """Screen size in points. The cached size is re-read when it does not match the
         orientation of the mirrored video (the iPhone has just rotated)."""
+        if hasattr(wda, "set_aspect") and self.screen_aspect:
+            wda.set_aspect(self.screen_aspect)
         w, h = wda.window_size()
         aspect = self.screen_aspect
-        if aspect and (w > h) != (aspect > 1):
+        if aspect and (w > h) != (aspect > 1) and not hasattr(wda, "set_aspect"):
             now = time.monotonic()
             if now - self._size_checked >= ROTATION_RECHECK_S:
                 self._size_checked = now
@@ -310,6 +382,12 @@ class Controller:
             wda.double_tap(px(a[0]), py(a[1]))
         elif kind == "long":
             wda.long_press(px(a[0]), py(a[1]))
+        elif kind == "touch_contact":
+            if hasattr(wda, "touch_contact"):
+                wda.touch_contact(px(a[0]), py(a[1]))
+        elif kind == "touch_release":
+            if hasattr(wda, "touch_release"):
+                wda.touch_release(px(a[0]), py(a[1]))
         elif kind == "swipe":
             ms = max(60, min(1500, a[4] * 1000))
             wda.swipe(px(a[0]), py(a[1]), px(a[2]), py(a[3]), duration_ms=ms)
@@ -323,30 +401,71 @@ class Controller:
             wda.app_switcher()
         elif kind == "button":
             wda.press_button(a[0])
+        elif kind == "lock":
+            wda.lock()
+        elif kind == "unlock":
+            wda.unlock()
+        elif kind == "rotate":
+            if hasattr(wda, "rotate"):
+                wda.rotate(a[0])
+            else:
+                log.info("rotate is only available over native USB control")
+        elif kind == "shake":
+            wda.shake()
+        elif kind == "set_pasteboard":
+            try:
+                wda.set_pasteboard(a[0])
+            except Exception:
+                if a[1] is not None:
+                    a[1](False)
+                raise
+            if a[1] is not None:
+                a[1](True)
+        elif kind == "get_pasteboard":
+            try:
+                text = wda.get_pasteboard()
+            except Exception:
+                if a[0] is not None:
+                    a[0](None)
+                raise
+            if a[0] is not None:
+                a[0](text)
         else:
             log.warning("unknown command %s", kind)
 
-    def _scroll(self, wda, w, h, xf, yf, notches):
+    def _scroll(self, wda, w, h, xf, yf, notches, axis="y"):
         now = time.monotonic()
-        carry, when = self._scroll_carry
-        if now - when > 1.0 or carry * notches < 0:
-            carry = 0.0  # stale, or the wheel changed direction
+        carry, when, old_axis = self._scroll_carry
+        if now - when > 1.0 or carry * notches < 0 or old_axis != axis:
+            carry = 0.0  # stale, wheel changed direction, or axis changed
         notches += carry
-        per_notch = SCROLL_PER_NOTCH * h
-        total = notches * per_notch  # points; > 0 = finger drags down
+        span = w if axis == "x" else h
+        per_notch = SCROLL_PER_NOTCH * span
+        total = notches * per_notch  # points; > 0 = finger drags down or right
         if abs(total) < SCROLL_MIN_PT:
-            self._scroll_carry = (notches, now)
+            self._scroll_carry = (notches, now, axis)
             return
-        x = min(max(xf * w, w * 0.08), w * 0.92)  # away from the edges (edge swipe = "back")
-        y = yf * h
-        for _ in range(SCROLL_MAX_STEPS):
-            if abs(total) < SCROLL_MIN_PT:
-                break
-            dy = max(-SCROLL_MAX_STEP * h, min(SCROLL_MAX_STEP * h, total))
-            y1 = min(max(y, h * 0.15 + max(0, -dy)), h * 0.85 - max(0, dy))
-            # the short pause before lifting the finger stops the scroll view from flinging,
-            # so one notch always scrolls the same distance
-            wda.swipe(x, y1, x, y1 + dy, duration_ms=150, hold_end_ms=60)
-            total -= dy
+        if axis == "x":
+            y = min(max(yf * h, h * 0.15), h * 0.85)
+            x = xf * w
+            for _ in range(SCROLL_MAX_STEPS):
+                if abs(total) < SCROLL_MIN_PT:
+                    break
+                dx = max(-SCROLL_MAX_STEP * w, min(SCROLL_MAX_STEP * w, total))
+                x1 = min(max(x, w * 0.12 + max(0, -dx)), w * 0.88 - max(0, dx))
+                wda.swipe(x1, y, x1 + dx, y, duration_ms=150, hold_end_ms=60)
+                total -= dx
+        else:
+            x = min(max(xf * w, w * 0.08), w * 0.92)  # away from the edges (edge swipe = "back")
+            y = yf * h
+            for _ in range(SCROLL_MAX_STEPS):
+                if abs(total) < SCROLL_MIN_PT:
+                    break
+                dy = max(-SCROLL_MAX_STEP * h, min(SCROLL_MAX_STEP * h, total))
+                y1 = min(max(y, h * 0.15 + max(0, -dy)), h * 0.85 - max(0, dy))
+                # the short pause before lifting the finger stops the scroll view from flinging,
+                # so one notch always scrolls the same distance
+                wda.swipe(x, y1, x, y1 + dy, duration_ms=150, hold_end_ms=60)
+                total -= dy
         rest = total / per_notch if abs(total) < SCROLL_MIN_PT else 0.0
-        self._scroll_carry = (rest, time.monotonic())
+        self._scroll_carry = (rest, time.monotonic(), axis)
